@@ -50,7 +50,8 @@ usertrap(void)
   // save user program counter.
   p->tf->epc = r_sepc();
   
-  if(r_scause() == 8){
+  uint64 scause = r_scause();
+  if(scause == 8){
     // system call
 
     if(p->killed)
@@ -67,6 +68,27 @@ usertrap(void)
     syscall();
   } else if((which_dev = devintr()) != 0){
     // ok
+  } else if (scause == 13 || scause == 15) {
+    uint64 va = r_stval();
+    if( va > p->sz ) {
+      //|| va < p->tf->sp 
+      printf("Access out of bound of pid:%d!\n", p->pid);
+      p->killed = 1;
+      exit(-1);
+    }
+    char *mem = kalloc();
+    if(mem == 0) {
+        printf("Out of mem!\n");
+        p->killed = 1;
+        exit(-1);
+    }
+    memset(mem,0,PGSIZE);
+    if(mappages(p->pagetable, PGROUNDDOWN(va), PGSIZE, (uint64)mem, PTE_W|PTE_X|PTE_R|PTE_U) != 0) {
+      kfree(mem);
+      printf("Failed to map the page for %d\n", p->pid);
+      p->killed = 1;
+      exit(-1);
+    }
   } else {
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
