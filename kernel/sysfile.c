@@ -52,6 +52,70 @@ fdalloc(struct file *f)
   return -1;
 }
 
+// after created, ip is still locked!!!!
+// if the target path existed, it will reture nulptr unless it's a file
+static struct inode*
+create(char *path, short type, short major, short minor)
+{
+  struct inode *ip, *dp;
+  char name[DIRSIZ];
+
+  if((dp = nameiparent(path, name)) == 0)
+    return 0;
+
+  ilock(dp);
+
+  if((ip = dirlookup(dp, name, 0)) != 0){
+    iunlockput(dp);
+    ilock(ip);
+    if(type == T_FILE && (ip->type == T_FILE || ip->type == T_DEVICE))
+      return ip;
+    iunlockput(ip);
+    return 0;
+  }
+
+  if((ip = ialloc(dp->dev, type)) == 0)
+    panic("create: ialloc");
+
+  ilock(ip);
+  ip->major = major;
+  ip->minor = minor;
+  ip->nlink = 1;
+  iupdate(ip);
+
+  if(type == T_DIR){  // Create . and .. entries.
+    dp->nlink++;  // for ".."
+    iupdate(dp);
+    // No ip->nlink++ for ".": avoid cyclic ref count.
+    if(dirlink(ip, ".", ip->inum) < 0 || dirlink(ip, "..", dp->inum) < 0)
+      panic("create dots");
+  }
+
+  if(dirlink(dp, name, ip->inum) < 0)
+    panic("create: dirlink");
+
+  iunlockput(dp);
+
+  return ip;
+}
+
+
+// Is the directory dp empty except for "." and ".." ?
+static int
+isdirempty(struct inode *dp)
+{
+  int off;
+  struct dirent de;
+
+  for(off=2*sizeof(de); off<dp->size; off+=sizeof(de)){
+    if(readi(dp, 0, (uint64)&de, off, sizeof(de)) != sizeof(de))
+      panic("isdirempty: readi");
+    if(de.inum != 0)
+      return 0;
+  }
+  return 1;
+}
+
 uint64
 sys_dup(void)
 {
@@ -165,22 +229,6 @@ bad:
   return -1;
 }
 
-// Is the directory dp empty except for "." and ".." ?
-static int
-isdirempty(struct inode *dp)
-{
-  int off;
-  struct dirent de;
-
-  for(off=2*sizeof(de); off<dp->size; off+=sizeof(de)){
-    if(readi(dp, 0, (uint64)&de, off, sizeof(de)) != sizeof(de))
-      panic("isdirempty: readi");
-    if(de.inum != 0)
-      return 0;
-  }
-  return 1;
-}
-
 uint64
 sys_unlink(void)
 {
@@ -238,51 +286,6 @@ bad:
   return -1;
 }
 
-static struct inode*
-create(char *path, short type, short major, short minor)
-{
-  struct inode *ip, *dp;
-  char name[DIRSIZ];
-
-  if((dp = nameiparent(path, name)) == 0)
-    return 0;
-
-  ilock(dp);
-
-  if((ip = dirlookup(dp, name, 0)) != 0){
-    iunlockput(dp);
-    ilock(ip);
-    if(type == T_FILE && (ip->type == T_FILE || ip->type == T_DEVICE))
-      return ip;
-    iunlockput(ip);
-    return 0;
-  }
-
-  if((ip = ialloc(dp->dev, type)) == 0)
-    panic("create: ialloc");
-
-  ilock(ip);
-  ip->major = major;
-  ip->minor = minor;
-  ip->nlink = 1;
-  iupdate(ip);
-
-  if(type == T_DIR){  // Create . and .. entries.
-    dp->nlink++;  // for ".."
-    iupdate(dp);
-    // No ip->nlink++ for ".": avoid cyclic ref count.
-    if(dirlink(ip, ".", ip->inum) < 0 || dirlink(ip, "..", dp->inum) < 0)
-      panic("create dots");
-  }
-
-  if(dirlink(dp, name, ip->inum) < 0)
-    panic("create: dirlink");
-
-  iunlockput(dp);
-
-  return ip;
-}
-
 uint64
 sys_open(void)
 {
@@ -304,11 +307,35 @@ sys_open(void)
       return -1;
     }
   } else {
-    if((ip = namei(path)) == 0){
-      end_op(ROOTDEV);
-      return -1;
+    
+    if (omode & O_NOFOLLOW) {
+      if((ip = namei(path)) == 0){
+        end_op(ROOTDEV);
+        return -1;
+      }
+      ilock(ip);
+    } else {
+      int cnt = 0;
+      // avoid the links form a cycle
+      while((++cnt) <= 10) {
+        if((ip = namei(path)) == 0){
+          end_op(ROOTDEV);
+          return -1;
+        }
+        ilock(ip);
+        if(ip->type == T_SYMLINK) {
+          readi(ip, 0, (uint64)path, 0, MAXPATH);
+          iunlockput(ip);
+          continue;
+        } else
+          break;
+      }
+      if (cnt > 10) {
+        end_op(ROOTDEV);
+        return -1;
+      }
     }
-    ilock(ip);
+
     if(ip->type == T_DIR && omode != O_RDONLY){
       iunlockput(ip);
       end_op(ROOTDEV);
@@ -347,6 +374,37 @@ sys_open(void)
 
   return fd;
 }
+
+
+uint64
+sys_symlink(void)
+{
+  //symlink(char *target, char *path) 
+  char path[MAXPATH], target[MAXPATH];
+  struct inode *ip;
+
+  if(argstr(0, target, MAXPATH) < 0 || argstr(1, path, MAXPATH) < 0)
+    return -1;
+
+  begin_op(ROOTDEV);
+
+  ip = create(path, T_SYMLINK, 0, 0); // already locked
+  if(ip == 0){
+    end_op(ROOTDEV);
+    return -1;
+  }
+
+  // MAXPATH = 128
+  // so path can be held in one block
+  if(writei(ip, 0, (uint64)target, 0, MAXPATH) != MAXPATH) {
+    panic("symlink: writei");
+  }
+  iunlockput(ip);
+
+  end_op(ROOTDEV);
+  return 0;
+}
+
 
 uint64
 sys_mkdir(void)
