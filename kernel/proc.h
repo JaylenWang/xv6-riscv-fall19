@@ -80,6 +80,18 @@ struct trapframe {
   /* 280 */ uint64 t6;
 };
 
+// Virtual Memory Area
+// recording the address, length, permissions, file, etc. 
+// for a virtual memory range created by mmap
+struct vma {
+  int ref;
+  uint64 vm_start;
+  uint len;
+  int prot;
+  int flags; // permission
+  struct file *f;
+};
+
 enum procstate { UNUSED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
 
 // Per-process state
@@ -103,4 +115,7 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
+
+  struct vma vma[NVMA];
+  
 };

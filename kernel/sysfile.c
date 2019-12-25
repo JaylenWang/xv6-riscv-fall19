@@ -483,3 +483,60 @@ sys_pipe(void)
   return 0;
 }
 
+
+// void *mmap(void *addr, uint len, int prot, int flags, int fd, uint offset);
+// useful: 1 len, 2 prot, 3 flags, 4 fd
+// assumption: 0 addr=0, 6 offset=0
+
+uint64
+sys_mmap(void) {
+  struct file *f;
+  int len, prot, flags;
+  struct vma *vma;
+  struct proc *p = myproc();
+
+  if (argint(1, &len) < 0 || argint(2, &prot) < 0 || argint(3, &flags) ||
+      argfd(4, 0, &f) < 0) {
+    return -1;
+  }
+  if (flags == MAP_SHARED && !f->writable && (prot & PROT_WRITE)) {
+    return -1;
+  }
+
+  vma = (struct vma*)0;
+  for (int i = 0; i < NVMA; i++) {
+    if ((p->vma[i]).ref == 0) {
+      vma = p->vma + i;
+      vma->ref = 1;
+      break;
+    }
+  }
+  if (vma == 0) {
+    return -1;
+  }
+
+  //TODO: a bug: there may be a gap between p->sz and vm_start
+  //    to become valid ???!
+  vma->vm_start = PGROUNDUP(p->sz);
+  vma->len = len;
+  vma->flags = flags;
+  vma->prot = prot;
+  vma->f = f;
+  p->sz = vma->vm_start + len;
+  
+  filedup(f);
+  return vma->vm_start;
+}
+
+// int munmap(void *addr, uint len)
+uint64
+sys_munmap(void) {
+  uint64 addr;
+  int len;
+
+  if (argaddr(0, &addr) < 0 || argint(1, &len) < 0) {
+    return -1;
+  }
+
+  return munmap_do(myproc(), addr, len);
+}

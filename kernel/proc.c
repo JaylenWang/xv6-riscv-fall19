@@ -8,6 +8,7 @@
 #include "file.h"
 #include "proc.h"
 #include "defs.h"
+#include "fcntl.h"
 
 struct cpu cpus[NCPU];
 
@@ -261,6 +262,14 @@ fork(void)
     release(&np->lock);
     return -1;
   }
+
+  for (int i = 0; i < NVMA; i++) {
+    if (p->vma[i].ref == 0)
+      continue;
+    np->vma[i] = p->vma[i];
+    filedup(p->vma[i].f);
+  }
+
   np->sz = p->sz;
 
   np->parent = p;
@@ -324,6 +333,12 @@ exit(int status)
 
   if(p == initproc)
     panic("init exiting");
+  
+  for (int i = 0; i < NVMA; i++) {
+    if (p->vma[i].ref != 0) {
+      munmap_do(p, p->vma[i].vm_start, p->vma[i].len);
+    } 
+  }
 
   // Close all open files.
   for(int fd = 0; fd < NOFILE; fd++){
@@ -689,4 +704,71 @@ procdump(void)
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
   }
+}
+
+struct vma*
+find_vma(struct proc *p, uint64 va) {
+  struct vma *vma = (struct vma *)0;
+  for (int i = 0; i < NVMA; i++) {
+    vma = p->vma + i;
+    if (vma->ref != 0 && vma->vm_start <= va && vma->vm_start + vma->len > va) {
+      return vma;
+    }
+  }
+  return (struct vma *)0;
+}
+
+// An munmap call might cover only a portion of an mmap-ed region, 
+// but you can assume that it will either unmap at the start,
+//  or at the end, or the whole region 
+//  (but not punch a hole in the middle of a region).
+#define max(a, b) ((a < b) ? (b) : (a))
+int
+munmap_do(struct proc *proc, uint64 addr, int len) {
+  struct vma *vma;
+
+  if (((vma = find_vma(proc, addr)) == (struct vma *)0)
+      || (vma->vm_start + vma->len < addr + len)) {
+    return -1;
+  }
+
+  vma->len -= len;
+  if (addr == vma->vm_start) { // unmap at the start
+    vma->vm_start = vma->vm_start + len;
+  } else { // unmap at the end
+    
+  }
+
+  struct file *f = vma->f;
+  if (vma->flags == MAP_SHARED && (vma->prot & PROT_WRITE)) {
+    for (; len > 0; len -= PGSIZE, addr += PGSIZE) {
+      uint64 pa = walkaddr(proc->pagetable, addr);
+      if (pa == 0) {
+        continue;
+      }
+      int writed = 0;
+      while(writed < PGSIZE){
+        int write_size = max(PGSIZE - writed, ((MAXOPBLOCKS-1-1-2) / 2) * BSIZE);
+
+        begin_op(f->ip->dev);
+        ilock(f->ip);
+        if ((writei(f->ip, 0, pa + writed, f->off, write_size)) != write_size)
+          panic("vmunmap bad filewrite");
+        f->off += write_size;
+        iunlock(f->ip);
+        end_op(f->ip->dev);
+
+        writed += write_size;
+      }
+      if (writed != PGSIZE) {
+        return -1;
+      }
+      uvmunmap(proc->pagetable, addr, PGSIZE, 1);
+    }
+  }
+  if (vma->len == 0) {
+    vma->ref = 0;
+    fileclose(vma->f);
+  }
+  return 0;
 }

@@ -5,6 +5,9 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "sleeplock.h"
+#include "fs.h"
+#include "file.h"
 
 struct spinlock tickslock;
 uint ticks;
@@ -53,7 +56,8 @@ usertrap(void)
   // save user program counter.
   p->tf->epc = r_sepc();
   
-  if(r_scause() == 8){
+  uint64 scause = r_scause();
+  if(scause == 8){
     // system call
 
     if(p->killed)
@@ -70,6 +74,29 @@ usertrap(void)
     syscall();
   } else if((which_dev = devintr()) != 0){
     // ok
+  } 
+  else if(scause == 13 || scause == 15) {
+      uint64 va = PGROUNDDOWN(r_stval());
+      struct vma *vma = find_vma(p, va);
+      if (!vma) { // invalidate access! not a mmap-ed region
+        p->killed = 1;
+      } else {
+        char *mem = (char*)kalloc();
+        if (mem == 0) {
+          printf("Failed to kalloc on page-fault!\n");
+          p->killed = 1;
+          exit(-1);
+        }
+        memset(mem, 0, PGSIZE);
+        ilock(vma->f->ip);
+        if (readi(vma->f->ip, 0, (uint64)mem, (uint)(va - vma->vm_start), PGSIZE) <= 0) {
+          panic("usertrap: readi on page-fault");
+        }
+        iunlock(vma->f->ip); // cannot use iunlockput()!!
+        if (mappages(p->pagetable, va, PGSIZE, (uint64)mem, vma->prot|PTE_U) != 0) {
+          panic("usertrap: mappages on page-fault");
+        }
+      }
   } else {
     printf("usertrap(): unexpected scause %p (%s) pid=%d\n", r_scause(), scause_desc(r_scause()), p->pid);
     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
